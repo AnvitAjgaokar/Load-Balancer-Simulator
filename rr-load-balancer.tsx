@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, createContext, useContext, ReactNode, RefObject } from 'react';
+import { BarChart, Bar, XAxis, YAxis, Tooltip, PieChart, Pie, Cell, Legend, ResponsiveContainer } from 'recharts';
 
 // Load Balancing Algorithms
 const loadBalancingAlgorithms: Record<string, string> = {
@@ -368,11 +369,10 @@ const DownArrowIcon = ({ open }: { open: boolean }) => (
   </span>
 );
 
-const ControlPanel = () => {
+const ControlPanel = ({ simulationState, setSimulationState }: { simulationState: 'stopped' | 'paused' | 'running', setSimulationState: (s: 'stopped' | 'paused' | 'running') => void }) => {
   const {
     algorithm,
     setAlgorithm,
-    servers,
     addServer,
     removeServer,
     toggleServer,
@@ -380,11 +380,49 @@ const ControlPanel = () => {
     setRequestRate,
     isSimulationRunning,
     toggleSimulation,
-    totalRequests,
-    setTotalRequests,
     resetSimulation,
     updateServer
   } = useLoadBalancer();
+
+  // --- Simulation state management ---
+  const [showStopConfirm, setShowStopConfirm] = useState(false);
+
+  useEffect(() => {
+    if (isSimulationRunning) {
+      setSimulationState('running');
+    } else if (simulationState === 'running') {
+      setSimulationState('paused');
+    }
+    // eslint-disable-next-line
+  }, [isSimulationRunning]);
+
+  // --- Button handlers ---
+  const handleSimulationButton = () => {
+    if (simulationState === 'stopped') {
+      setSimulationState('running');
+      toggleSimulation();
+    } else if (simulationState === 'paused') {
+      setSimulationState('running');
+      toggleSimulation();
+    } else if (simulationState === 'running') {
+      setSimulationState('paused');
+      toggleSimulation();
+    }
+  };
+
+  const handleStopSimulation = () => {
+    setShowStopConfirm(true);
+  };
+
+  const confirmStopSimulation = () => {
+    setShowStopConfirm(false);
+    setSimulationState('stopped');
+    resetSimulation();
+  };
+
+  const cancelStopSimulation = () => {
+    setShowStopConfirm(false);
+  };
 
   const [newServerConfig, setNewServerConfig] = useState({
     name: '',
@@ -473,18 +511,27 @@ const ControlPanel = () => {
           <div style={{marginTop: 12, display: 'flex', gap: 8}}>
             <button
               style={{...styles.button, ...styles.primaryButton}}
-              onClick={toggleSimulation}
+              onClick={handleSimulationButton}
               disabled={isSimulationRunning === undefined}
             >
-              {isSimulationRunning ? 'Pause Simulation' : 'Start Simulation'}
+              {simulationState === 'stopped' && 'Start Simulation'}
+              {simulationState === 'paused' && 'Continue Simulation'}
+              {simulationState === 'running' && 'Pause Simulation'}
             </button>
             <button
               style={{...styles.button, ...styles.dangerButton}}
-              onClick={resetSimulation}
+              onClick={handleStopSimulation}
             >
               Stop Simulation
             </button>
           </div>
+          {showStopConfirm && (
+            <div style={{marginTop: 16, background: '#fff3cd', border: '1px solid #ffeeba', borderRadius: 8, padding: 16, color: '#856404'}}>
+              <div style={{marginBottom: 12}}>Are you sure you want to stop the simulation? This will reset all server stats.</div>
+              <button style={{...styles.button, ...styles.dangerButton, marginRight: 8}} onClick={confirmStopSimulation}>Yes, Stop</button>
+              <button style={{...styles.button}} onClick={cancelStopSimulation}>Cancel</button>
+            </div>
+          )}
         </div>
       )
     },
@@ -536,7 +583,7 @@ const ControlPanel = () => {
       title: 'Server Management',
       content: (
         <div style={{ marginTop: 12 }}>
-          {servers.map(server => (
+          {useLoadBalancer().servers.map((server: Server) => (
             <div key={server.id} style={{marginBottom: '10px', padding: '10px', border: '1px solid #ddd', borderRadius: '4px'}}>
               {editServerId === server.id ? (
                 <>
@@ -664,7 +711,7 @@ const VisualizationCanvas = () => {
               }}
             >
               {server.name}
-              <div style={{fontSize: '10px', position: 'absolute', bottom: '-20px'}}>
+              <div style={{fontSize: '10px', position: 'absolute', bottom: '-20px', color: 'black'}}>
                 {server.currentConnections}/{server.maxConnections}
               </div>
             </div>
@@ -785,7 +832,8 @@ const StatsPanel = () => {
 // Update movingRequests type
 type MovingRequest = { id: number; serverId: number };
 
-const LoadBalancerProvider = ({ children }: { children: ReactNode }) => {
+// Update LoadBalancerProvider to accept simulationState and setSimulationState as props
+const LoadBalancerProvider = ({ children, simulationState, setSimulationState, onStatsUpdate }: { children: ReactNode, simulationState: 'stopped' | 'paused' | 'running', setSimulationState: (s: 'stopped' | 'paused' | 'running') => void, onStatsUpdate: (servers: Server[], totalRequests: number) => void }) => {
   const [servers, setServers] = useState<Server[]>([]);
   const [algorithm, _setAlgorithm] = useState('RR');
   const [requestRate, setRequestRate] = useState(5);
@@ -800,7 +848,6 @@ const LoadBalancerProvider = ({ children }: { children: ReactNode }) => {
 
   // Initialize with sample servers
   useEffect(() => {
-    // Clear any existing servers in the LoadBalancer (for hot reloads or remounts)
     loadBalancerRef.current.servers = [];
     loadBalancerRef.current.weights = new Map();
     loadBalancerRef.current.currentIndex = 0;
@@ -838,13 +885,14 @@ const LoadBalancerProvider = ({ children }: { children: ReactNode }) => {
               serverId: targetServer.id
             };
             setMovingRequests(prev => [...prev.slice(-MAX_ANIMATED_REQUESTS + 1), newRequest]);
-            // Remove after animation
             setTimeout(() => {
               setMovingRequests(prev => prev.filter(r => r.id !== requestId));
             }, 600);
           }
         }
         setServers([...loadBalancerRef.current.servers]);
+        // Update stats for report
+        onStatsUpdate([...loadBalancerRef.current.servers], totalRequests + 1);
       }, 1000 / requestRate);
     }
     return () => {
@@ -853,6 +901,14 @@ const LoadBalancerProvider = ({ children }: { children: ReactNode }) => {
       }
     };
   }, [isSimulationRunning, requestRate, servers]);
+
+  // Also update stats when simulation is stopped
+  useEffect(() => {
+    if (simulationState === 'stopped') {
+      onStatsUpdate([...loadBalancerRef.current.servers], totalRequests);
+    }
+    // eslint-disable-next-line
+  }, [simulationState]);
 
   const addServer = (config: ServerConfig) => {
     const newServer = new Server(
@@ -884,9 +940,8 @@ const LoadBalancerProvider = ({ children }: { children: ReactNode }) => {
     setIsSimulationRunning(!isSimulationRunning);
   };
 
-  const resetSimulation = () => {
-    setIsSimulationRunning(false);
-    setTotalRequests(0);
+  // In LoadBalancerProvider, move the clearing logic to a new function
+  const clearSimulationStats = () => {
     loadBalancerRef.current.servers.forEach(server => {
       server.currentConnections = 0;
       server.totalRequests = 0;
@@ -897,19 +952,18 @@ const LoadBalancerProvider = ({ children }: { children: ReactNode }) => {
     setMovingRequests([]);
   };
 
-  const setAlgorithm = (alg: string) => {
-    _setAlgorithm(alg);
-    // Reset stats and server state on algorithm change
+  const resetSimulation = () => {
     setIsSimulationRunning(false);
     setTotalRequests(0);
-    loadBalancerRef.current.servers.forEach(server => {
-      server.currentConnections = 0;
-      server.totalRequests = 0;
-      server.totalResponseTime = 0;
-      server.queue = [];
-    });
-    setServers([...loadBalancerRef.current.servers]);
-    setMovingRequests([]);
+    setSimulationState('stopped');
+    // Do not clear stats here!
+  };
+
+  const setAlgorithm = (alg: string) => {
+    _setAlgorithm(alg);
+    setIsSimulationRunning(false);
+    // Do not reset stats here, only stop simulation
+    setSimulationState('stopped');
   };
 
   const updateServer = (serverId: number, config: ServerConfig) => {
@@ -962,14 +1016,195 @@ const useBeforeUnloadWarning = () => {
   }, []);
 };
 
+// --- Simulation Report ---
+const COLORS = ['#0088FE', '#00C49F', '#FFBB28', '#FF8042', '#A28BFE', '#FF6B6B'];
+
+// Define type for perServer analytics
+interface ServerAnalytics {
+  name: string;
+  totalRequests: number;
+  avgResponse: number;
+  maxConnections: number;
+  weight: number;
+}
+
+function getReportAnalytics(servers: Server[], totalRequests: number) {
+  if (!servers.length) return null;
+  const mostTraffic = [...servers].sort((a, b) => b.totalRequests - a.totalRequests)[0];
+  const leastTraffic = [...servers].sort((a, b) => a.totalRequests - b.totalRequests)[0];
+  const avgResponse = servers.reduce((acc: number, s: Server) => acc + Number(s.getAverageResponseTime()), 0) / servers.length;
+  return {
+    totalRequests,
+    avgResponse: avgResponse.toFixed(2),
+    mostTraffic: { name: mostTraffic.name, count: mostTraffic.totalRequests },
+    leastTraffic: { name: leastTraffic.name, count: leastTraffic.totalRequests },
+    perServer: servers.map((s: Server): ServerAnalytics => ({
+      name: s.name,
+      totalRequests: s.totalRequests,
+      avgResponse: Number(s.getAverageResponseTime()),
+      maxConnections: s.maxConnections,
+      weight: s.weight
+    }))
+  };
+}
+
+const SimulationReport = ({ servers, totalRequests, onClose }: { servers: Server[], totalRequests: number, onClose: () => void }) => {
+  const analytics = getReportAnalytics(servers, totalRequests);
+  if (!analytics) return null;
+
+  // Download as JSON
+  const handleDownload = () => {
+    const dataStr = 'data:text/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(analytics, null, 2));
+    const dlAnchor = document.createElement('a');
+    dlAnchor.setAttribute('href', dataStr);
+    dlAnchor.setAttribute('download', 'simulation_report.json');
+    dlAnchor.click();
+  };
+
+  return (
+    <div style={{ position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh', background: 'rgba(0,0,0,0.45)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+      <div style={{ background: '#fff', borderRadius: 12, padding: 32, minWidth: 420, maxWidth: 700, boxShadow: '0 4px 32px rgba(0,0,0,0.18)', position: 'relative' }}>
+        <button onClick={onClose} style={{ position: 'absolute', top: 16, right: 16, background: 'none', border: 'none', fontSize: 22, cursor: 'pointer' }}>&times;</button>
+        <h2 style={{ marginBottom: 12 }}>Simulation Report</h2>
+        <div style={{ marginBottom: 18 }}>
+          <strong>Total Requests:</strong> {analytics.totalRequests}<br />
+          <strong>Average Response Time:</strong> {analytics.avgResponse} ms<br />
+          <strong>Server with Most Traffic:</strong> {analytics.mostTraffic.name} ({analytics.mostTraffic.count} requests)<br />
+          <strong>Server with Least Traffic:</strong> {analytics.leastTraffic.name} ({analytics.leastTraffic.count} requests)
+        </div>
+        <div style={{ width: '100%', height: 220, marginBottom: 24 }}>
+          <ResponsiveContainer width="100%" height="100%">
+            <BarChart data={analytics.perServer}>
+              <XAxis dataKey="name" />
+              <YAxis allowDecimals={false} />
+              <Tooltip />
+              <Legend />
+              <Bar dataKey="totalRequests" fill="#0088FE" name="Total Requests" />
+              <Bar dataKey="avgResponse" fill="#FFBB28" name="Avg Response (ms)" />
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+        <div style={{ width: '100%', height: 220, marginBottom: 24 }}>
+          <ResponsiveContainer width="100%" height="100%">
+            <PieChart>
+              <Pie data={analytics.perServer} dataKey="totalRequests" nameKey="name" cx="50%" cy="50%" outerRadius={70} label>
+                {analytics.perServer.map((entry: ServerAnalytics, idx: number) => (
+                  <Cell key={`cell-${idx}`} fill={COLORS[idx % COLORS.length]} />
+                ))}
+              </Pie>
+              <Tooltip />
+              <Legend />
+            </PieChart>
+          </ResponsiveContainer>
+        </div>
+        <button onClick={handleDownload} style={{ ...styles.button, ...styles.primaryButton, width: 180, fontSize: 16 }}>Download Report (JSON)</button>
+      </div>
+    </div>
+  );
+};
+
 const LoadBalancerSimulator = () => {
   useBeforeUnloadWarning();
+  // Manage simulation state at the top level
+  const [simulationState, setSimulationState] = React.useState<'stopped' | 'paused' | 'running'>('stopped');
+  const [showReport, setShowReport] = React.useState(false);
+  const [showReportButtons, setShowReportButtons] = React.useState(false);
+  const [hasSimulated, setHasSimulated] = React.useState(false);
+
+  // Access stats from context
+  const [servers, setServers] = React.useState<Server[]>([]);
+  const [totalRequests, setTotalRequests] = React.useState<number>(0);
+  // Store a snapshot for the report
+  const [reportSnapshot, setReportSnapshot] = React.useState<{servers: Server[], totalRequests: number} | null>(null);
+
+  // Listen for simulation stop to show report buttons and capture snapshot
+  React.useEffect(() => {
+    if (simulationState === 'stopped' && hasSimulated && servers.length > 0) {
+      // Take a snapshot BEFORE reset
+      setReportSnapshot({ servers: servers.map(s => Object.assign(Object.create(Object.getPrototypeOf(s)), s)), totalRequests });
+      setShowReportButtons(true);
+    } else if (simulationState === 'running') {
+      setShowReportButtons(false);
+      setShowReport(false);
+      setReportSnapshot(null);
+    }
+  }, [simulationState, servers.length, hasSimulated]);
+
+  // Track if a simulation has ever run
+  React.useEffect(() => {
+    if (simulationState === 'running') {
+      setHasSimulated(true);
+    }
+  }, [simulationState]);
+
+  // Provide a way for LoadBalancerProvider to update stats for report
+  const handleStatsUpdate = (srv: Server[], total: number) => {
+    setServers(srv);
+    setTotalRequests(total);
+  };
+
+  // In LoadBalancerSimulator, define a function to get the real stats from the LoadBalancer instance
+  const getCurrentStats = () => {
+    // @ts-ignore
+    const lb = (window as any).loadBalancerRefInstance;
+    if (lb) {
+      return {
+        servers: lb.servers.map((s: Server) => Object.assign(Object.create(Object.getPrototypeOf(s)), s)),
+        totalRequests: lb.servers.reduce((acc: number, s: Server) => acc + s.totalRequests, 0)
+      };
+    }
+    return { servers: [], totalRequests: 0 };
+  };
+  // Pass getCurrentStats to ControlPanel
+
+  const handleDownload = () => {
+    if (!reportSnapshot) return;
+    const analytics = getReportAnalytics(reportSnapshot.servers, reportSnapshot.totalRequests);
+    if (!analytics) return;
+    const dataStr = 'data:text/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(analytics, null, 2));
+    const dlAnchor = document.createElement('a');
+    dlAnchor.setAttribute('href', dataStr);
+    dlAnchor.setAttribute('download', 'simulation_report.json');
+    dlAnchor.click();
+  };
+
+  const handleCloseReport = () => {
+    setShowReport(false);
+    setShowReportButtons(false);
+    setShouldClearStats(true);
+  };
+
+  const [shouldClearStats, setShouldClearStats] = React.useState(false);
+
+  React.useEffect(() => {
+    if (shouldClearStats) {
+      // @ts-ignore
+      if (window.loadBalancerRefInstance && window.loadBalancerRefInstance.clearSimulationStats) {
+        window.loadBalancerRefInstance.clearSimulationStats();
+      }
+      setShouldClearStats(false);
+    }
+  }, [shouldClearStats]);
+
   return (
-    <LoadBalancerProvider>
+    <LoadBalancerProvider simulationState={simulationState} setSimulationState={setSimulationState} onStatsUpdate={handleStatsUpdate}>
       <div style={styles.container}>
-        <ControlPanel />
+        <ControlPanel simulationState={simulationState} setSimulationState={setSimulationState} />
         <VisualizationCanvas />
         <StatsPanel />
+        {showReportButtons && reportSnapshot && (
+          <div style={{ position: 'fixed', bottom: 32, left: 0, width: '100vw', display: 'flex', justifyContent: 'center', zIndex: 100 }}>
+            <button style={{ ...styles.button, ...styles.primaryButton, fontSize: 16, marginRight: 12 }} onClick={() => setShowReport(true)}>
+              View Report
+            </button>
+            <button style={{ ...styles.button, ...styles.primaryButton, fontSize: 16 }} onClick={handleDownload}>
+              Download Report
+            </button>
+          </div>
+        )}
+        {showReport && reportSnapshot && (
+          <SimulationReport servers={reportSnapshot.servers} totalRequests={reportSnapshot.totalRequests} onClose={handleCloseReport} />
+        )}
       </div>
     </LoadBalancerProvider>
   );
