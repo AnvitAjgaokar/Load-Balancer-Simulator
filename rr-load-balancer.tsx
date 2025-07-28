@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, createContext, useContext, ReactNode, RefObject } from 'react';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, PieChart, Pie, Cell, Legend, ResponsiveContainer } from 'recharts';
+import * as XLSX from 'xlsx';
 
 // Load Balancing Algorithms
 const loadBalancingAlgorithms: Record<string, string> = {
@@ -240,9 +241,10 @@ const styles: Record<string, Style> = {
     display: 'flex',
     flexDirection: 'column' as React.CSSProperties['flexDirection'],
     alignItems: 'center',
-    justifyContent: 'center',
+    justifyContent: 'flex-start', // Align to top for more space
     position: 'relative' as React.CSSProperties['position'],
-    overflow: 'hidden'
+    overflow: 'hidden',
+    minHeight: 0 // For flexbox overflow
   },
   rightPanel: {
     width: '350px',
@@ -308,10 +310,12 @@ const styles: Record<string, Style> = {
     width: '100%',
     maxWidth: '900px',
     overflowY: 'auto',
-    maxHeight: '260px', // limit height for scroll
+    // maxHeight: '260px', // REMOVE this restriction
     alignItems: 'start',
     padding: '8px 0',
-    marginBottom: '16px'
+    marginBottom: '16px',
+    flex: 1, // Allow to grow and fill available vertical space
+    minHeight: 0 // For flexbox overflow
   },
   server: {
     width: '100px',
@@ -1052,53 +1056,85 @@ const SimulationReport = ({ servers, totalRequests, onClose }: { servers: Server
   const analytics = getReportAnalytics(servers, totalRequests);
   if (!analytics) return null;
 
-  // Download as JSON
+  // Download as Excel
   const handleDownload = () => {
-    const dataStr = 'data:text/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(analytics, null, 2));
-    const dlAnchor = document.createElement('a');
-    dlAnchor.setAttribute('href', dataStr);
-    dlAnchor.setAttribute('download', 'simulation_report.json');
-    dlAnchor.click();
+    // Prepare summary sheet
+    const summaryData = [
+      ['Total Requests', analytics.totalRequests],
+      ['Average Response Time (ms)', analytics.avgResponse],
+      ['Server with Most Traffic', `${analytics.mostTraffic.name} (${analytics.mostTraffic.count})`],
+      ['Server with Least Traffic', `${analytics.leastTraffic.name} (${analytics.leastTraffic.count})`]
+    ];
+    const summarySheet = XLSX.utils.aoa_to_sheet(summaryData);
+
+    // Prepare per-server analytics sheet
+    const perServerData = [
+      ['Server Name', 'Total Requests', 'Avg Response (ms)', 'Max Connections', 'Weight'],
+      ...analytics.perServer.map(s => [s.name, s.totalRequests, s.avgResponse, s.maxConnections, s.weight])
+    ];
+    const perServerSheet = XLSX.utils.aoa_to_sheet(perServerData);
+
+    // Placeholder for charts (since exporting images is non-trivial)
+    const chartsSheet = XLSX.utils.aoa_to_sheet([
+      ['Charts are not included in this Excel export. Please refer to the app for visualizations.']
+    ]);
+
+    // Create workbook
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, summarySheet, 'Summary');
+    XLSX.utils.book_append_sheet(wb, perServerSheet, 'Per-Server Analytics');
+    XLSX.utils.book_append_sheet(wb, chartsSheet, 'Charts');
+
+    // Export to file
+    XLSX.writeFile(wb, 'simulation_report.xlsx');
   };
 
   return (
     <div style={{ position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh', background: 'rgba(0,0,0,0.45)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-      <div style={{ background: '#fff', borderRadius: 12, padding: 32, minWidth: 420, maxWidth: 700, boxShadow: '0 4px 32px rgba(0,0,0,0.18)', position: 'relative' }}>
+      <div style={{ background: '#fff', borderRadius: 12, padding: 32, minWidth: 700, maxWidth: 1200, boxShadow: '0 4px 32px rgba(0,0,0,0.18)', position: 'relative', display: 'flex', flexDirection: 'column', width: '80vw', maxHeight: '90vh' }}>
         <button onClick={onClose} style={{ position: 'absolute', top: 16, right: 16, background: 'none', border: 'none', fontSize: 22, cursor: 'pointer' }}>&times;</button>
         <h2 style={{ marginBottom: 12 }}>Simulation Report</h2>
-        <div style={{ marginBottom: 18 }}>
-          <strong>Total Requests:</strong> {analytics.totalRequests}<br />
-          <strong>Average Response Time:</strong> {analytics.avgResponse} ms<br />
-          <strong>Server with Most Traffic:</strong> {analytics.mostTraffic.name} ({analytics.mostTraffic.count} requests)<br />
-          <strong>Server with Least Traffic:</strong> {analytics.leastTraffic.name} ({analytics.leastTraffic.count} requests)
+        <div style={{ display: 'flex', flexDirection: 'row', gap: 32, width: '100%', flex: 1, minHeight: 0 }}>
+          {/* Info summary */}
+          <div style={{ flex: 1, minWidth: 220, maxWidth: 340, display: 'flex', flexDirection: 'column', justifyContent: 'flex-start' }}>
+            <div style={{ marginBottom: 18 }}>
+              <strong>Total Requests:</strong> {analytics.totalRequests}<br />
+              <strong>Average Response Time:</strong> {analytics.avgResponse} ms<br />
+              <strong>Server with Most Traffic:</strong> {analytics.mostTraffic.name} ({analytics.mostTraffic.count} requests)<br />
+              <strong>Server with Least Traffic:</strong> {analytics.leastTraffic.name} ({analytics.leastTraffic.count} requests)
+            </div>
+            <button onClick={handleDownload} style={{ ...styles.button, ...styles.primaryButton, width: 180, fontSize: 16, marginTop: 12 }}>Download Report (Excel)</button>
+          </div>
+          {/* Charts side by side */}
+          <div style={{ flex: 2, display: 'flex', flexDirection: 'row', gap: 24, minWidth: 0 }}>
+            <div style={{ width: '50%', minWidth: 0, height: 320 }}>
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={analytics.perServer}>
+                  <XAxis dataKey="name" />
+                  <YAxis allowDecimals={false} />
+                  <Tooltip />
+                  <Legend />
+                  <Bar dataKey="totalRequests" fill="#0088FE" name="Total Requests" />
+                  <Bar dataKey="avgResponse" fill="#FFBB28" name="Avg Response (ms)" />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+            <div style={{ width: '50%', minWidth: 0, height: 320 }}>
+              <ResponsiveContainer width="100%" height="100%">
+                <PieChart>
+                  <Pie data={analytics.perServer} dataKey="totalRequests" nameKey="name" cx="50%" cy="50%" outerRadius={70} label>
+                    {analytics.perServer.map((entry: ServerAnalytics, idx: number) => (
+                      <Cell key={`cell-${idx}`} fill={COLORS[idx % COLORS.length]} />
+                    ))}
+                  </Pie>
+                  <Tooltip />
+                  <Legend />
+                </PieChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
         </div>
-        <div style={{ width: '100%', height: 220, marginBottom: 24 }}>
-          <ResponsiveContainer width="100%" height="100%">
-            <BarChart data={analytics.perServer}>
-              <XAxis dataKey="name" />
-              <YAxis allowDecimals={false} />
-              <Tooltip />
-              <Legend />
-              <Bar dataKey="totalRequests" fill="#0088FE" name="Total Requests" />
-              <Bar dataKey="avgResponse" fill="#FFBB28" name="Avg Response (ms)" />
-            </BarChart>
-          </ResponsiveContainer>
         </div>
-        <div style={{ width: '100%', height: 220, marginBottom: 24 }}>
-          <ResponsiveContainer width="100%" height="100%">
-            <PieChart>
-              <Pie data={analytics.perServer} dataKey="totalRequests" nameKey="name" cx="50%" cy="50%" outerRadius={70} label>
-                {analytics.perServer.map((entry: ServerAnalytics, idx: number) => (
-                  <Cell key={`cell-${idx}`} fill={COLORS[idx % COLORS.length]} />
-                ))}
-              </Pie>
-              <Tooltip />
-              <Legend />
-            </PieChart>
-          </ResponsiveContainer>
-        </div>
-        <button onClick={handleDownload} style={{ ...styles.button, ...styles.primaryButton, width: 180, fontSize: 16 }}>Download Report (JSON)</button>
-      </div>
     </div>
   );
 };
@@ -1161,11 +1197,35 @@ const LoadBalancerSimulator = () => {
     if (!reportSnapshot) return;
     const analytics = getReportAnalytics(reportSnapshot.servers, reportSnapshot.totalRequests);
     if (!analytics) return;
-    const dataStr = 'data:text/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(analytics, null, 2));
-    const dlAnchor = document.createElement('a');
-    dlAnchor.setAttribute('href', dataStr);
-    dlAnchor.setAttribute('download', 'simulation_report.json');
-    dlAnchor.click();
+    // Prepare summary sheet
+    const summaryData = [
+      ['Total Requests', analytics.totalRequests],
+      ['Average Response Time (ms)', analytics.avgResponse],
+      ['Server with Most Traffic', `${analytics.mostTraffic.name} (${analytics.mostTraffic.count})`],
+      ['Server with Least Traffic', `${analytics.leastTraffic.name} (${analytics.leastTraffic.count})`]
+    ];
+    const summarySheet = XLSX.utils.aoa_to_sheet(summaryData);
+
+    // Prepare per-server analytics sheet
+    const perServerData = [
+      ['Server Name', 'Total Requests', 'Avg Response (ms)', 'Max Connections', 'Weight'],
+      ...analytics.perServer.map(s => [s.name, s.totalRequests, s.avgResponse, s.maxConnections, s.weight])
+    ];
+    const perServerSheet = XLSX.utils.aoa_to_sheet(perServerData);
+
+    // Placeholder for charts (since exporting images is non-trivial)
+    const chartsSheet = XLSX.utils.aoa_to_sheet([
+      ['Charts are not included in this Excel export. Please refer to the app for visualizations.']
+    ]);
+
+    // Create workbook
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, summarySheet, 'Summary');
+    XLSX.utils.book_append_sheet(wb, perServerSheet, 'Per-Server Analytics');
+    XLSX.utils.book_append_sheet(wb, chartsSheet, 'Charts');
+
+    // Export to file
+    XLSX.writeFile(wb, 'simulation_report.xlsx');
   };
 
   const handleCloseReport = () => {
@@ -1198,7 +1258,7 @@ const LoadBalancerSimulator = () => {
               View Report
             </button>
             <button style={{ ...styles.button, ...styles.primaryButton, fontSize: 16 }} onClick={handleDownload}>
-              Download Report
+              Download Report (Excel)
             </button>
           </div>
         )}
