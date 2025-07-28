@@ -1,52 +1,36 @@
+import { LoadBalancingAlgorithms } from './algorithms';
 import { 
   Server, 
   ClientRequest, 
   LoadBalancerConfig, 
+  LoadBalancingAlgorithm, 
   LoadBalancerStats, 
   RequestLog, 
-  HealthCheckResult, 
-  FailoverEvent,
-  AnalyticsData,
-  SimulationConfig
+  FailoverEvent, 
+  AnalyticsData, 
+  SimulationConfig,
+  ServerConfig,
+  HealthCheckResult
 } from './types';
-import { LoadBalancingAlgorithms } from './algorithms';
 
 export class EnhancedLoadBalancer {
   private servers: Server[] = [];
   private config: LoadBalancerConfig;
   private algorithms: LoadBalancingAlgorithms;
-  private requestCounter: number = 0;
   private stats: LoadBalancerStats;
   private requestLogs: RequestLog[] = [];
   private failoverEvents: FailoverEvent[] = [];
   private healthCheckIntervals: Map<string, NodeJS.Timeout> = new Map();
   private simulationConfig: SimulationConfig;
+  private requestCounter: number = 0;
+  private lastStatsUpdate: number = Date.now();
+  private maxLogs: number = 1000; // Limit logs to prevent memory issues
 
   constructor(config: LoadBalancerConfig) {
-    this.config = config;
+    this.config = { ...config };
     this.algorithms = new LoadBalancingAlgorithms();
     this.stats = this.initializeStats();
-    this.simulationConfig = this.initializeSimulationConfig();
-  }
-
-  private initializeStats(): LoadBalancerStats {
-    return {
-      totalRequests: 0,
-      successfulRequests: 0,
-      failedRequests: 0,
-      averageResponseTime: 0,
-      algorithm: this.config.algorithm,
-      activeServers: 0,
-      totalServers: 0,
-      failoverEvents: 0,
-      lastFailover: 0,
-      requestRate: 0,
-      throughput: 0
-    };
-  }
-
-  private initializeSimulationConfig(): SimulationConfig {
-    return {
+    this.simulationConfig = {
       requestRate: 10,
       requestPattern: 'steady',
       clientDistribution: 'uniform',
@@ -61,6 +45,19 @@ export class EnhancedLoadBalancer {
         maxRequestSize: 10240,
         requestSizeDistribution: 'normal'
       }
+    };
+  }
+
+  private initializeStats(): LoadBalancerStats {
+    return {
+      totalRequests: 0,
+      successfulRequests: 0,
+      failedRequests: 0,
+      averageResponseTime: 0,
+      totalServers: 0,
+      activeServers: 0,
+      failoverEvents: 0,
+      lastUpdate: Date.now()
     };
   }
 
@@ -94,7 +91,7 @@ export class EnhancedLoadBalancer {
         return this.active && this.healthy && this.currentConnections < this.maxConnections;
       }
     };
-
+    
     this.servers.push(server);
     this.algorithms.updateServerWeights(this.servers);
     this.startHealthCheck(server);
@@ -113,272 +110,303 @@ export class EnhancedLoadBalancer {
       this.healthCheckIntervals.delete(serverId);
     }
 
+    // Handle algorithm cleanup
+    this.algorithms.handleServerRemoval(serverId);
+
     this.servers.splice(index, 1);
     this.algorithms.updateServerWeights(this.servers);
     this.updateStats();
     return true;
   }
 
-  public updateServer(serverId: string, updates: Partial<Server>): boolean {
+  public updateServer(serverId: string, config: Partial<ServerConfig>): boolean {
     const server = this.servers.find(s => s.id === serverId);
     if (!server) return false;
 
-    Object.assign(server, updates);
+    // Update server properties
+    Object.assign(server, config);
     
-    // Update weight in algorithm
-    if (updates.weight !== undefined) {
-      server.originalWeight = updates.weight;
+    // Update algorithm weights if weight changed
+    if (config.weight !== undefined) {
       this.algorithms.updateServerWeights(this.servers);
-    }
-
-    // Restart health check if interval changed
-    if (updates.healthCheckInterval !== undefined) {
-      const interval = this.healthCheckIntervals.get(serverId);
-      if (interval) {
-        clearInterval(interval);
-      }
-      this.startHealthCheck(server);
     }
 
     this.updateStats();
     return true;
   }
 
-  public distributeRequest(request: Partial<ClientRequest>): { request: ClientRequest; server: Server | null; success: boolean } {
-    const clientRequest: ClientRequest = {
-      id: request.id || `req-${++this.requestCounter}`,
+  public distributeRequest(request: Partial<ClientRequest> = {}): { success: boolean; server?: Server } {
+    try {
+      const activeServers = this.servers.filter(s => s.active && s.healthy);
+      
+      if (activeServers.length === 0) {
+        this.logRequest({
+          id: `req-${++this.requestCounter}`,
+          timestamp: Date.now(),
+          clientIp: request.clientIp || this.generateClientIp(),
+          sessionId: request.sessionId || this.generateSessionId(),
+          requestSize: request.requestSize || this.generateRequestSize(),
+          priority: request.priority || 'normal',
+          timeout: request.timeout || this.config.requestTimeout,
+          status: 'failed',
+          selectedServer: 'none',
+          algorithm: this.config.algorithm,
+          responseTime: 0,
+          reason: 'No available servers'
+        });
+        return { success: false };
+      }
+
+      const selectedServer = this.algorithms.selectServer(activeServers, request as ClientRequest, this.config.algorithm);
+      
+      if (!selectedServer) {
+        this.logRequest({
+          id: `req-${++this.requestCounter}`,
+          timestamp: Date.now(),
+          clientIp: request.clientIp || this.generateClientIp(),
+          sessionId: request.sessionId || this.generateSessionId(),
+          requestSize: request.requestSize || this.generateRequestSize(),
+          priority: request.priority || 'normal',
+          timeout: request.timeout || this.config.requestTimeout,
+          status: 'failed',
+          selectedServer: 'none',
+          algorithm: this.config.algorithm,
+          responseTime: 0,
+          reason: 'No server selected by algorithm'
+        });
+        return { success: false };
+      }
+
+      const success = this.processRequestOnServer(selectedServer, request);
+      return { success, server: selectedServer };
+    } catch (error) {
+      console.error('Error distributing request:', error);
+      return { success: false };
+    }
+  }
+
+  private processRequestOnServer(server: Server, request: Partial<ClientRequest>): boolean {
+    try {
+      if (!server.canAcceptRequest()) {
+        return false;
+      }
+
+      // Simulate failure based on configuration
+      if (this.simulationConfig.failureSimulation?.enabled) {
+        if (Math.random() < this.simulationConfig.failureSimulation.failureRate) {
+          this.simulateFailure(server, request);
+          return false;
+        }
+      }
+
+      const requestId = `req-${++this.requestCounter}`;
+      const startTime = Date.now();
+      
+      // Update server state
+      server.currentConnections++;
+      server.totalRequests++;
+      server.currentLoad = (server.currentConnections / server.maxConnections) * 100;
+
+      // Simulate processing time
+      const processingTime = server.processingTime + Math.random() * 200;
+      
+      setTimeout(() => {
+        const responseTime = Date.now() - startTime;
+        server.currentConnections = Math.max(0, server.currentConnections - 1);
+        server.totalResponseTime += responseTime;
+        server.currentLoad = (server.currentConnections / server.maxConnections) * 100;
+
+        // Update response time history (keep last 50 entries)
+        server.responseTimeHistory.push(responseTime);
+        if (server.responseTimeHistory.length > 50) {
+          server.responseTimeHistory.shift();
+        }
+
+        this.logRequest({
+          id: requestId,
+          timestamp: startTime,
+          clientIp: request.clientIp || this.generateClientIp(),
+          sessionId: request.sessionId || this.generateSessionId(),
+          requestSize: request.requestSize || this.generateRequestSize(),
+          priority: request.priority || 'normal',
+          timeout: request.timeout || this.config.requestTimeout,
+          status: 'success',
+          selectedServer: server.id,
+          algorithm: this.config.algorithm,
+          responseTime,
+          reason: 'Request processed successfully'
+        });
+
+        this.updateStats();
+      }, processingTime);
+
+      return true;
+    } catch (error) {
+      console.error('Error processing request on server:', error);
+      return false;
+    }
+  }
+
+  private simulateFailure(server: Server, request: Partial<ClientRequest>): void {
+    const failureTypes = this.simulationConfig.failureSimulation?.failureTypes || ['timeout'];
+    const failureType = failureTypes[Math.floor(Math.random() * failureTypes.length)];
+    
+    server.consecutiveFailures++;
+    server.failedRequests++;
+    
+    if (server.consecutiveFailures >= server.failureThreshold) {
+      server.healthy = false;
+      this.triggerFailover(server, failureType);
+    }
+
+    this.logRequest({
+      id: `req-${++this.requestCounter}`,
       timestamp: Date.now(),
       clientIp: request.clientIp || this.generateClientIp(),
       sessionId: request.sessionId || this.generateSessionId(),
       requestSize: request.requestSize || this.generateRequestSize(),
-      priority: request.priority || 'medium',
+      priority: request.priority || 'normal',
       timeout: request.timeout || this.config.requestTimeout,
-      processed: false,
-      processingTime: 0,
+      status: 'failed',
+      selectedServer: server.id,
+      algorithm: this.config.algorithm,
       responseTime: 0,
-      status: 'pending'
-    };
-
-    const selectedServer = this.algorithms.selectServer(this.servers, clientRequest, this.config.algorithm);
-    
-    if (!selectedServer) {
-      clientRequest.status = 'failed';
-      clientRequest.error = 'No available servers';
-      this.logRequest(clientRequest, null, false);
-      this.updateStats();
-      return { request: clientRequest, server: null, success: false };
-    }
-
-    const success = this.processRequestOnServer(clientRequest, selectedServer);
-    this.logRequest(clientRequest, selectedServer, success);
-    this.updateStats();
-    
-    return { request: clientRequest, server: selectedServer, success };
+      reason: `Simulated failure: ${failureType}`
+    });
   }
 
-  private processRequestOnServer(request: ClientRequest, server: Server): boolean {
-    if (!server.canAcceptRequest()) {
-      request.status = 'failed';
-      request.error = 'Server at capacity';
-      return false;
-    }
+  private startHealthCheck(server: Server): void {
+    if (!this.config.healthCheckEnabled) return;
 
-    server.currentConnections++;
-    server.totalRequests++;
-    request.serverId = server.id;
-    request.status = 'processing';
-
-    // Simulate processing
-    const processingTime = this.calculateProcessingTime(server, request);
-    request.processingTime = processingTime;
-
-    setTimeout(() => {
-      this.completeRequest(request, server, processingTime);
-    }, processingTime);
-
-    return true;
-  }
-
-  private completeRequest(request: ClientRequest, server: Server, processingTime: number) {
-    server.currentConnections = Math.max(0, server.currentConnections - 1);
-    
-    // Simulate potential failure
-    if (this.simulationConfig.failureSimulation.enabled && 
-        Math.random() < this.simulationConfig.failureSimulation.failureRate) {
-      request.status = 'failed';
-      request.error = 'Simulated failure';
-      server.failedRequests++;
-      server.consecutiveFailures++;
-      server.failureHistory.push({
-        timestamp: Date.now(),
-        reason: 'Simulated failure'
-      });
-    } else {
-      request.status = 'completed';
-      request.responseTime = processingTime;
-      server.totalResponseTime += processingTime;
-      server.responseTimeHistory.push(processingTime);
-      server.consecutiveFailures = 0;
-    }
-
-    // Keep only last 100 response times
-    if (server.responseTimeHistory.length > 100) {
-      server.responseTimeHistory = server.responseTimeHistory.slice(-100);
-    }
-
-    this.updateStats();
-  }
-
-  private calculateProcessingTime(server: Server, request: ClientRequest): number {
-    let baseTime = server.processingTime;
-    
-    // Adjust based on current load
-    const loadFactor = server.currentConnections / server.maxConnections;
-    baseTime *= (1 + loadFactor * 0.5);
-
-    // Adjust based on request size
-    const sizeFactor = request.requestSize / 10240; // Normalize to 10KB
-    baseTime *= (1 + sizeFactor * 0.3);
-
-    // Add some randomness
-    baseTime *= (0.8 + Math.random() * 0.4);
-
-    return Math.round(baseTime);
-  }
-
-  private processRequestOnServer(request: ClientRequest, server: Server): boolean {
-    if (!server.canAcceptRequest()) {
-      request.status = 'failed';
-      request.error = 'Server at capacity';
-      return false;
-    }
-
-    server.currentConnections++;
-    server.totalRequests++;
-    request.serverId = server.id;
-    request.status = 'processing';
-
-    // Simulate processing
-    const processingTime = this.calculateProcessingTime(server, request);
-    request.processingTime = processingTime;
-
-    setTimeout(() => {
-      this.completeRequest(request, server, processingTime);
-    }, processingTime);
-
-    return true;
-  }
-
-  private startHealthCheck(server: Server) {
     const interval = setInterval(() => {
       this.performHealthCheck(server);
     }, server.healthCheckInterval);
-    
+
     this.healthCheckIntervals.set(server.id, interval);
   }
 
-  private performHealthCheck(server: Server) {
-    const startTime = Date.now();
-    const healthy = Math.random() > 0.05; // 95% success rate for health checks
-    const responseTime = healthy ? 50 + Math.random() * 100 : 500 + Math.random() * 1000;
+  private performHealthCheck(server: Server): HealthCheckResult {
+    const now = Date.now();
+    const result: HealthCheckResult = {
+      serverId: server.id,
+      timestamp: now,
+      healthy: server.healthy,
+      responseTime: 0,
+      reason: ''
+    };
 
-    setTimeout(() => {
-      const wasHealthy = server.healthy;
-      server.lastHealthCheck = Date.now();
+    try {
+      // Simulate health check
+      const responseTime = Math.random() * 100 + 50;
+      result.responseTime = responseTime;
 
-      if (healthy) {
-        server.consecutiveFailures = Math.max(0, server.consecutiveFailures - 1);
-        if (server.consecutiveFailures < server.recoveryThreshold) {
-          server.healthy = true;
-        }
-      } else {
+      if (responseTime > 500) {
         server.consecutiveFailures++;
-        if (server.consecutiveFailures >= server.failureThreshold) {
-          server.healthy = false;
-          this.triggerFailover(server, 'health-check-failed');
-        }
+        result.reason = 'High response time';
+      } else {
+        server.consecutiveFailures = Math.max(0, server.consecutiveFailures - 1);
+        result.reason = 'Healthy';
       }
 
-      if (wasHealthy !== server.healthy) {
-        this.updateStats();
+      if (server.consecutiveFailures >= server.failureThreshold) {
+        server.healthy = false;
+        result.healthy = false;
+        result.reason = 'Too many consecutive failures';
+        this.triggerFailover(server, 'health-check-failed');
+      } else if (server.consecutiveFailures <= server.recoveryThreshold && !server.healthy) {
+        server.healthy = true;
+        result.healthy = true;
+        result.reason = 'Recovered from failures';
       }
-    }, responseTime);
+
+      server.lastHealthCheck = now;
+      this.updateStats();
+    } catch (error) {
+      console.error('Health check error:', error);
+      result.healthy = false;
+      result.reason = 'Health check error';
+    }
+
+    return result;
   }
 
-  private triggerFailover(failedServer: Server, reason: string) {
+  private triggerFailover(server: Server, reason: string): void {
+    if (!this.config.failoverEnabled) return;
+
     const failoverEvent: FailoverEvent = {
+      id: `failover-${Date.now()}`,
       timestamp: Date.now(),
-      serverId: failedServer.id,
-      reason: reason as any,
-      requestsAffected: failedServer.currentConnections
+      serverId: server.id,
+      serverName: server.name,
+      reason,
+      previousStatus: 'healthy',
+      newStatus: 'unhealthy'
     };
 
     this.failoverEvents.push(failoverEvent);
     this.stats.failoverEvents++;
-    this.stats.lastFailover = Date.now();
-  }
-
-  private logRequest(request: ClientRequest, server: Server | null, success: boolean) {
-    const log: RequestLog = {
-      id: request.id,
-      timestamp: request.timestamp,
-      clientIp: request.clientIp,
-      sessionId: request.sessionId,
-      algorithm: this.config.algorithm,
-      selectedServer: server?.id || 'none',
-      requestSize: request.requestSize,
-      responseTime: request.responseTime,
-      status: success ? 'success' : 'failure',
-      error: request.error,
-      failover: false
-    };
-
-    this.requestLogs.push(log);
     
-    // Keep only last 1000 logs
-    if (this.requestLogs.length > 1000) {
-      this.requestLogs = this.requestLogs.slice(-1000);
+    // Keep only last 100 failover events
+    if (this.failoverEvents.length > 100) {
+      this.failoverEvents = this.failoverEvents.slice(-100);
     }
   }
 
-  private updateStats() {
-    const activeServers = this.servers.filter(s => s.active && s.healthy);
-    const totalResponseTime = this.servers.reduce((sum, s) => sum + s.totalResponseTime, 0);
-    const totalRequests = this.servers.reduce((sum, s) => sum + s.totalRequests, 0);
+  private logRequest(log: RequestLog): void {
+    this.requestLogs.push(log);
+    
+    // Keep only last N logs to prevent memory issues
+    if (this.requestLogs.length > this.maxLogs) {
+      this.requestLogs = this.requestLogs.slice(-this.maxLogs);
+    }
+  }
+
+  private updateStats(): void {
+    const now = Date.now();
+    if (now - this.lastStatsUpdate < 100) return; // Throttle updates
 
     this.stats = {
-      ...this.stats,
-      activeServers: activeServers.length,
+      totalRequests: this.requestLogs.length,
+      successfulRequests: this.requestLogs.filter(log => log.status === 'success').length,
+      failedRequests: this.requestLogs.filter(log => log.status === 'failed').length,
+      averageResponseTime: this.calculateAverageResponseTime(),
       totalServers: this.servers.length,
-      averageResponseTime: totalRequests > 0 ? totalResponseTime / totalRequests : 0,
-      algorithm: this.config.algorithm
+      activeServers: this.servers.filter(s => s.active && s.healthy).length,
+      failoverEvents: this.failoverEvents.length,
+      lastUpdate: now
     };
+
+    this.lastStatsUpdate = now;
+  }
+
+  private calculateAverageResponseTime(): number {
+    const successfulLogs = this.requestLogs.filter(log => log.status === 'success' && log.responseTime > 0);
+    if (successfulLogs.length === 0) return 0;
+    
+    const totalResponseTime = successfulLogs.reduce((sum, log) => sum + log.responseTime, 0);
+    return totalResponseTime / successfulLogs.length;
   }
 
   private generateClientIp(): string {
-    const segments = [];
+    const octets = [];
     for (let i = 0; i < 4; i++) {
-      segments.push(Math.floor(Math.random() * 256));
+      octets.push(Math.floor(Math.random() * 256));
     }
-    return segments.join('.');
+    return octets.join('.');
   }
 
   private generateSessionId(): string {
-    return Math.random().toString(36).substring(2, 15);
+    return `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
   }
 
   private generateRequestSize(): number {
-    if (!this.simulationConfig.loadSimulation.enabled) {
-      return 1024; // Default 1KB
-    }
+    const { minRequestSize = 1024, maxRequestSize = 10240, requestSizeDistribution = 'normal' } = 
+      this.simulationConfig.loadSimulation || {};
 
-    const { minRequestSize, maxRequestSize, requestSizeDistribution } = this.simulationConfig.loadSimulation;
-    
     switch (requestSizeDistribution) {
       case 'uniform':
-        return Math.floor(Math.random() * (maxRequestSize - minRequestSize) + minRequestSize);
+        return Math.floor(Math.random() * (maxRequestSize - minRequestSize + 1)) + minRequestSize;
       case 'normal':
-        // Simplified normal distribution
         const mean = (minRequestSize + maxRequestSize) / 2;
         const stdDev = (maxRequestSize - minRequestSize) / 6;
         const normalValue = mean + (Math.random() + Math.random() + Math.random() - 1.5) * stdDev;
@@ -393,7 +421,33 @@ export class EnhancedLoadBalancer {
     }
   }
 
-  // Public getters
+  public updateConfig(config: Partial<LoadBalancerConfig>): void {
+    this.config = { ...this.config, ...config };
+  }
+
+  public updateSimulationConfig(config: Partial<SimulationConfig>): void {
+    this.simulationConfig = { ...this.simulationConfig, ...config };
+  }
+
+  public reset(): void {
+    this.servers.forEach(server => {
+      server.currentConnections = 0;
+      server.totalRequests = 0;
+      server.totalResponseTime = 0;
+      server.failedRequests = 0;
+      server.consecutiveFailures = 0;
+      server.healthy = true;
+      server.responseTimeHistory = [];
+      server.failureHistory = [];
+      server.queue = [];
+    });
+    
+    this.requestLogs = [];
+    this.failoverEvents = [];
+    this.algorithms.resetAlgorithm();
+    this.updateStats();
+  }
+
   public getServers(): Server[] {
     return [...this.servers];
   }
@@ -433,45 +487,46 @@ export class EnhancedLoadBalancer {
       perServer,
       requestLogs: this.requestLogs,
       algorithmPerformance: this.calculateAlgorithmPerformance(),
-      timeSeriesData: this.generateTimeSeriesData()
+      timeSeriesData: this.generateTimeSeriesData(),
+      algorithmStats: this.algorithms.getAlgorithmStats()
     };
   }
 
-  private calculateAlgorithmPerformance() {
-    // This would be implemented to track performance per algorithm
-    return {} as any;
-  }
-
-  private generateTimeSeriesData() {
-    // This would generate time series data for charts
-    return [];
-  }
-
-  public updateConfig(newConfig: Partial<LoadBalancerConfig>) {
-    Object.assign(this.config, newConfig);
-    if (newConfig.algorithm) {
-      this.algorithms.resetAlgorithm();
-    }
-  }
-
-  public updateSimulationConfig(newConfig: Partial<SimulationConfig>) {
-    Object.assign(this.simulationConfig, newConfig);
-  }
-
-  public reset() {
-    this.servers.forEach(server => {
-      server.currentConnections = 0;
-      server.totalRequests = 0;
-      server.totalResponseTime = 0;
-      server.failedRequests = 0;
-      server.consecutiveFailures = 0;
-      server.responseTimeHistory = [];
-      server.failureHistory = [];
-    });
+  private calculateAlgorithmPerformance(): any {
+    const algorithmStats: { [key: string]: any } = {};
+    const algorithms = ['ROUND_ROBIN', 'WEIGHTED_ROUND_ROBIN', 'LEAST_CONNECTIONS', 'LEAST_RESPONSE_TIME', 'IP_HASH', 'STICKY_SESSIONS'];
     
-    this.requestLogs = [];
-    this.failoverEvents = [];
-    this.algorithms.resetAlgorithm();
-    this.stats = this.initializeStats();
+    algorithms.forEach(algorithm => {
+      const logs = this.requestLogs.filter(log => log.algorithm === algorithm);
+      algorithmStats[algorithm] = {
+        totalRequests: logs.length,
+        successRate: logs.length > 0 ? (logs.filter(log => log.status === 'success').length / logs.length) * 100 : 0,
+        averageResponseTime: logs.filter(log => log.status === 'success').length > 0 
+          ? logs.filter(log => log.status === 'success').reduce((sum, log) => sum + log.responseTime, 0) / logs.filter(log => log.status === 'success').length 
+          : 0
+      };
+    });
+
+    return algorithmStats;
+  }
+
+  private generateTimeSeriesData(): any {
+    const now = Date.now();
+    const timeRanges = [1, 5, 15, 60]; // minutes
+    const data: { [key: string]: any[] } = {};
+
+    timeRanges.forEach(range => {
+      const cutoff = now - (range * 60 * 1000);
+      const logs = this.requestLogs.filter(log => log.timestamp > cutoff);
+      
+      data[`${range}m`] = logs.map(log => ({
+        timestamp: log.timestamp,
+        responseTime: log.responseTime,
+        status: log.status,
+        serverId: log.selectedServer
+      }));
+    });
+
+    return data;
   }
 } 

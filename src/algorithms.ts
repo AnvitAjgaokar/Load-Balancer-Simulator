@@ -7,6 +7,7 @@ export class LoadBalancingAlgorithms {
   private sessionMap: Map<string, string> = new Map(); // sessionId -> serverId
   private lastSessionCleanup: number = Date.now();
   private sessionTimeout: number = 300000; // 5 minutes
+  private sessionTimestamps: Map<string, number> = new Map(); // sessionId -> timestamp
 
   constructor() {
     this.initializeWeights();
@@ -25,6 +26,11 @@ export class LoadBalancingAlgorithms {
     
     if (activeServers.length === 0) {
       return null;
+    }
+
+    // Handle edge case: only one server available
+    if (activeServers.length === 1) {
+      return activeServers[0];
     }
 
     switch (algorithm) {
@@ -46,6 +52,9 @@ export class LoadBalancingAlgorithms {
   }
 
   private roundRobin(servers: Server[]): Server {
+    // Ensure we have valid servers
+    if (servers.length === 0) return null as any;
+    
     const server = servers[this.currentIndex % servers.length];
     this.currentIndex = (this.currentIndex + 1) % servers.length;
     return server;
@@ -58,6 +67,12 @@ export class LoadBalancingAlgorithms {
         this.weights.set(server.id, { current: server.weight, max: server.weight });
       }
     });
+
+    // Handle edge case: all weights are 0
+    const totalWeight = servers.reduce((sum, server) => sum + server.weight, 0);
+    if (totalWeight === 0) {
+      return this.roundRobin(servers);
+    }
 
     // Find server with highest current weight
     let selectedServer: Server | null = null;
@@ -90,27 +105,47 @@ export class LoadBalancingAlgorithms {
 
   private leastConnections(servers: Server[]): Server {
     // Sort by current connections, then by response time as tiebreaker
-    return servers.sort((a, b) => {
+    const sortedServers = servers.sort((a, b) => {
       if (a.currentConnections !== b.currentConnections) {
         return a.currentConnections - b.currentConnections;
       }
-      return this.getAverageResponseTime(a) - this.getAverageResponseTime(b);
-    })[0];
+      // Tiebreaker: least response time
+      const avgA = this.getAverageResponseTime(a);
+      const avgB = this.getAverageResponseTime(b);
+      if (avgA !== avgB) {
+        return avgA - avgB;
+      }
+      // Second tiebreaker: server ID for consistency
+      return a.id.localeCompare(b.id);
+    });
+    
+    return sortedServers[0];
   }
 
   private leastResponseTime(servers: Server[]): Server {
-    return servers.sort((a, b) => {
+    const sortedServers = servers.sort((a, b) => {
       const avgA = this.getAverageResponseTime(a);
       const avgB = this.getAverageResponseTime(b);
       if (avgA !== avgB) {
         return avgA - avgB;
       }
       // Tiebreaker: least connections
-      return a.currentConnections - b.currentConnections;
-    })[0];
+      if (a.currentConnections !== b.currentConnections) {
+        return a.currentConnections - b.currentConnections;
+      }
+      // Second tiebreaker: server ID for consistency
+      return a.id.localeCompare(b.id);
+    });
+    
+    return sortedServers[0];
   }
 
   private ipHash(servers: Server[], request: ClientRequest): Server {
+    // Handle edge case: no client IP
+    if (!request.clientIp) {
+      return this.roundRobin(servers);
+    }
+
     const hash = this.hashString(request.clientIp);
     const index = hash % servers.length;
     return servers[index];
@@ -125,7 +160,13 @@ export class LoadBalancingAlgorithms {
       if (existingServerId) {
         const existingServer = servers.find(s => s.id === existingServerId);
         if (existingServer && existingServer.active && existingServer.healthy) {
+          // Update session timestamp
+          this.sessionTimestamps.set(request.sessionId, Date.now());
           return existingServer;
+        } else {
+          // Remove invalid session mapping
+          this.sessionMap.delete(request.sessionId);
+          this.sessionTimestamps.delete(request.sessionId);
         }
       }
     }
@@ -133,9 +174,10 @@ export class LoadBalancingAlgorithms {
     // If no existing session or server is unavailable, use least connections
     const selectedServer = this.leastConnections(servers);
     
-    // Store session mapping
+    // Store session mapping with timestamp
     if (request.sessionId) {
       this.sessionMap.set(request.sessionId, selectedServer.id);
+      this.sessionTimestamps.set(request.sessionId, Date.now());
     }
 
     return selectedServer;
@@ -162,11 +204,10 @@ export class LoadBalancingAlgorithms {
   private cleanupExpiredSessions() {
     const now = Date.now();
     if (now - this.lastSessionCleanup > 60000) { // Cleanup every minute
-      for (const [sessionId, serverId] of this.sessionMap.entries()) {
-        // For simplicity, we'll just clear old sessions
-        // In a real implementation, you'd track session creation time
-        if (Math.random() < 0.01) { // 1% chance to clear each session
+      for (const [sessionId, timestamp] of this.sessionTimestamps.entries()) {
+        if (now - timestamp > this.sessionTimeout) {
           this.sessionMap.delete(sessionId);
+          this.sessionTimestamps.delete(sessionId);
         }
       }
       this.lastSessionCleanup = now;
@@ -179,6 +220,10 @@ export class LoadBalancingAlgorithms {
         this.weights.set(server.id, { current: server.weight, max: server.weight });
       } else {
         this.weights.get(server.id)!.max = server.weight;
+        // Reset current weight if it's higher than the new max
+        if (this.weights.get(server.id)!.current > server.weight) {
+          this.weights.get(server.id)!.current = server.weight;
+        }
       }
     });
   }
@@ -187,5 +232,42 @@ export class LoadBalancingAlgorithms {
     this.currentIndex = 0;
     this.weights.clear();
     this.sessionMap.clear();
+    this.sessionTimestamps.clear();
+  }
+
+  // Public method to get algorithm statistics
+  public getAlgorithmStats() {
+    return {
+      sessionCount: this.sessionMap.size,
+      weightMap: Object.fromEntries(this.weights),
+      currentIndex: this.currentIndex
+    };
+  }
+
+  // Method to validate algorithm state
+  public validateState(servers: Server[]): boolean {
+    // Check if all server weights are properly initialized
+    const allServersHaveWeights = servers.every(server => this.weights.has(server.id));
+    
+    // Check if session mappings are valid
+    const validSessions = Array.from(this.sessionMap.values()).every(serverId => 
+      servers.some(server => server.id === serverId)
+    );
+    
+    return allServersHaveWeights && validSessions;
+  }
+
+  // Method to handle server removal
+  public handleServerRemoval(serverId: string) {
+    // Remove from weights
+    this.weights.delete(serverId);
+    
+    // Remove from session map
+    for (const [sessionId, mappedServerId] of this.sessionMap.entries()) {
+      if (mappedServerId === serverId) {
+        this.sessionMap.delete(sessionId);
+        this.sessionTimestamps.delete(sessionId);
+      }
+    }
   }
 } 
