@@ -1,6 +1,10 @@
-import React from 'react';
-import { createRoot } from 'react-dom/client';
-import LoadBalancerSimulator from './rr-load-balancer';
+import React from 'react'
+import ReactDOM from 'react-dom/client'
+import { EnhancedLoadBalancerSimulator } from './src/EnhancedLoadBalancerSimulator'
+import './index.css'
 
-const root = createRoot(document.getElementById('root')!);
-root.render(<React.StrictMode><LoadBalancerSimulator /></React.StrictMode>); 
+ReactDOM.createRoot(document.getElementById('root')!).render(
+  <React.StrictMode>
+    <EnhancedLoadBalancerSimulator />
+  </React.StrictMode>,
+) 
